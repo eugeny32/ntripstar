@@ -35,7 +35,7 @@ import numpy as np
 # 1. Чтение облака
 # ----------------------------------------------------------------------------
 
-def read_las(path, max_points=4_000_000):
+def read_las(path, max_points):
     las = laspy.read(path)
     pts = np.column_stack([np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)])
     try:
@@ -203,6 +203,27 @@ def save_images(density, outline, openings, gaps, res, ortho_path, preview_path)
     cv2.imwrite(preview_path, prev)
 
 
+def ensure_writable(out_path, las_path):
+    """Проверяет, что выходной файл можно создать.
+
+    Защитник Windows (контролируемый доступ к папкам) и OneDrive блокируют
+    запись в Documents с невнятной ошибкой FileNotFoundError. В этом случае
+    переносим вывод в папку исходного LAS.
+    """
+    import os
+    try:
+        with open(out_path, "w"):
+            pass
+        os.remove(out_path)
+        return out_path
+    except OSError:
+        fallback = os.path.join(os.path.dirname(os.path.abspath(las_path)),
+                                os.path.basename(out_path))
+        print(f"  ВНИМАНИЕ: нет записи в '{out_path}' (антивирус/OneDrive "
+              f"блокирует папку?) — сохраняю рядом с LAS: {fallback}")
+        return fallback
+
+
 def main():
     ap = argparse.ArgumentParser(description="LAS -> DXF-подоснова фасада")
     ap.add_argument("las", help="входной файл LAS/LAZ")
@@ -217,10 +238,12 @@ def main():
                     help="минимальная площадь проёма, м²")
     ap.add_argument("--rect", type=float, default=0.85,
                     help="порог прямоугольности: выше — проём, ниже — пропуск данных")
+    ap.add_argument("--max-points", type=int, default=15_000_000,
+                    help="прореживание облака до N точек (по умолчанию 15 млн)")
     args = ap.parse_args()
 
     print(f"Читаю {args.las} ...")
-    pts, _ = read_las(args.las)
+    pts, _ = read_las(args.las, args.max_points)
     print(f"  точек: {len(pts):,}")
 
     print("Ищу плоскость фасада (RANSAC)...")
@@ -229,17 +252,31 @@ def main():
           f"направление в плане: ({direction[0]:+.3f}, {direction[1]:+.3f})")
 
     u, v, _ = project_to_facade(pts, origin_xy, direction, args.slice)
-    density, (u0, v0) = rasterize(u, v, args.res)
-    print(f"Растр {density.shape[1]}x{density.shape[0]} px @ {args.res} м/px; "
+
+    # при редком облаке мелкий растр разваливается на несвязные точки —
+    # подбираем шаг так, чтобы на ячейку приходилось ~3 точки стены
+    area = (u.max() - u.min()) * (v.max() - v.min())
+    res = args.res
+    auto_res = float(np.sqrt(3.0 * area / max(len(u), 1)))
+    if auto_res > res * 1.3:
+        res = round(auto_res, 3)
+        print(f"  ВНИМАНИЕ: точек в срезе мало ({len(u):,} на {area:.0f} м²) — "
+              f"растр укрупнён до {res} м/px.\n"
+              f"  Для детализации дайте больше точек: --max-points 30000000, "
+              f"либо вырежьте один фасад из облака (ReCap/CloudCompare).")
+
+    density, (u0, v0) = rasterize(u, v, res)
+    print(f"Растр {density.shape[1]}x{density.shape[0]} px @ {res} м/px; "
           f"фасад ~{(u.max() - u.min()):.1f} x {(v.max() - v.min()):.1f} м")
 
-    outline, openings, gaps, _ = detect(density, args.res,
+    outline, openings, gaps, _ = detect(density, res,
                                         args.min_opening, args.rect)
     print(f"Найдено проёмов: {len(openings)}, зон на проверку (пропуски): {len(gaps)}")
 
-    stem = args.out.rsplit(".", 1)[0]
-    write_dxf(args.out, outline, openings, gaps, (0.0, 0.0))
-    save_images(density, outline, openings, gaps, args.res,
+    out = ensure_writable(args.out, args.las)
+    stem = out.rsplit(".", 1)[0]
+    write_dxf(out, outline, openings, gaps, (0.0, 0.0))
+    save_images(density, outline, openings, gaps, res,
                 stem + "_ortho.png", stem + "_preview.png")
     with open(stem + "_meta.json", "w", encoding="utf-8") as f:
         json.dump({
@@ -251,7 +288,7 @@ def main():
             "note": "точка DXF (u,v) -> мир: origin + u*direction, Z = v_zero + v",
         }, f, ensure_ascii=False, indent=2)
 
-    print(f"Готово: {args.out}, {stem}_ortho.png, {stem}_preview.png, {stem}_meta.json")
+    print(f"Готово: {out}, {stem}_ortho.png, {stem}_preview.png, {stem}_meta.json")
 
 
 if __name__ == "__main__":
