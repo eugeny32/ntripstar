@@ -189,6 +189,14 @@ def detect(density, res, min_opening_m2, min_rectangularity):
 # 6. Вывод DXF, ортофото, превью
 # ----------------------------------------------------------------------------
 
+def imwrite_unicode(path, img):
+    """cv2.imwrite ломается на кириллических путях Windows — пишем сами."""
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError(f"Не удалось закодировать PNG: {path}")
+    with open(path, "wb") as f:
+        f.write(buf.tobytes())
+
 def write_dxf(path, outline, openings, gaps):
     doc = ezdxf.new("R2018", setup=True)
     doc.header["$INSUNITS"] = 6  # метры
@@ -210,7 +218,7 @@ def save_images(density, outline, openings, gaps, res, ortho_path, preview_path)
     img = np.clip(density / max(np.percentile(density[density > 0], 90), 1) * 255,
                   0, 255).astype(np.uint8)
     img = cv2.flip(img, 0)  # v растёт вверх, а строки изображения — вниз
-    cv2.imwrite(ortho_path, img)
+    imwrite_unicode(ortho_path, img)
 
     prev = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     hpx = img.shape[0]
@@ -224,7 +232,7 @@ def save_images(density, outline, openings, gaps, res, ortho_path, preview_path)
         for (x, y, w, h) in rects:
             p1, p2 = to_px(x, y), to_px(x + w, y + h)
             cv2.rectangle(prev, p1, p2, color, 2)
-    cv2.imwrite(preview_path, prev)
+    imwrite_unicode(preview_path, prev)
 
 
 def save_scene_plan(pts_xy, facades, path, res=0.25):
@@ -250,7 +258,7 @@ def save_scene_plan(pts_xy, facades, path, res=0.25):
         mid = to_px((a + b) / 2)
         cv2.putText(plan, f"f{f['index']:02d}", (mid[0] + 4, mid[1] - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 128, 255), 2)
-    cv2.imwrite(path, plan)
+    imwrite_unicode(path, plan)
 
 
 def ensure_writable(out_path, las_path):

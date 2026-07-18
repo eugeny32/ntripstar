@@ -5,3 +5,8 @@
 *_meta.json
 __pycache__/
 *_scene_plan.png
+gui_plan.png
+gui_preview.png
+build/
+dist/
+*.spec
