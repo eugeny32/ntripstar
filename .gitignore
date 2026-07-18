@@ -1,0 +1,6 @@
+*.las
+*.dxf
+*_ortho.png
+*_preview.png
+*_meta.json
+__pycache__/
