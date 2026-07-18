@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-facade2dxf — прототип конвейера «облако точек LAS -> DXF-подоснова фасада».
+facade2dxf — прототип конвейера «облако точек LAS -> DXF-подоснова фасадов».
 
 Что делает:
   1. Читает LAS/LAZ (laspy).
-  2. Находит доминирующую вертикальную плоскость (фасад) RANSAC-подгонкой
-     прямой по проекции точек на план XY (ось Z считается вертикальной).
-  3. Вырезает слой точек вдоль плоскости и проецирует его в 2D-координаты
-     фасада: u — вдоль стены, v — высота.
-  4. Строит растровую карту плотности (ортоизображение фасада).
-  5. Находит проёмы как «дыры» в плотности внутри контура фасада;
-     прямоугольные дыры уходят в слой OPENINGS, нерегулярные — в GAPS_REVIEW
-     (вероятные пропуски сканирования, требуют проверки человеком).
-  6. Пишет DXF (метры): FACADE_OUTLINE, OPENINGS, GAPS_REVIEW,
-     а рядом — ортофото PNG, превью с детекцией и JSON с привязкой к миру.
+  2. Итеративно находит вертикальные плоскости (фасады) RANSAC-подгонкой
+     прямых по проекции облака на план XY (ось Z считается вертикальной).
+     Каждая плоскость разбивается на отдельные фасады по разрывам в плане
+     (разные здания на одной линии не склеиваются).
+  3. Каждый фасад: срез точек вдоль плоскости -> проекция в 2D (u — вдоль
+     стены, v — высота) -> карта плотности -> детекция проёмов.
+     Прямоугольные «дыры» уходят в слой OPENINGS, нерегулярные — в
+     GAPS_REVIEW (вероятные пропуски сканирования — проверить вручную).
+  4. На каждый фасад пишутся: DXF в метрах (FACADE_OUTLINE / OPENINGS /
+     GAPS_REVIEW), ортофото PNG, превью с детекцией, JSON с привязкой к миру.
+     Плюс общий план сцены scene_plan.png с номерами найденных фасадов.
 
 Запуск:
-  python3 facade2dxf.py вход.las -o фасад.dxf
+  python3 facade2dxf.py вход.las -o фасад.dxf            # все фасады: фасад_f01.dxf, ...
+  python3 facade2dxf.py вход.las -o фасад.dxf --facades 1  # только доминирующий
 Подробнее: python3 facade2dxf.py --help
 """
 
 import argparse
 import json
+import os
 import sys
 
 import cv2
@@ -51,6 +54,22 @@ def read_las(path, max_points):
 # ----------------------------------------------------------------------------
 # 2. Поиск плоскости фасада (RANSAC по прямой в плане)
 # ----------------------------------------------------------------------------
+
+def filter_vertical(pts, cell=0.5, min_extent=2.0):
+    """Оставляет точки вертикальных структур (стены), убирая землю и мусор.
+
+    План разбивается на ячейки cell x cell; остаются точки ячеек, где
+    перепад высот не меньше min_extent — у земли и кустов он мал.
+    """
+    ij = np.floor(pts[:, :2] / cell).astype(np.int64)
+    _, inv = np.unique(ij, axis=0, return_inverse=True)
+    ncell = inv.max() + 1
+    zmin = np.full(ncell, np.inf)
+    zmax = np.full(ncell, -np.inf)
+    np.minimum.at(zmin, inv, pts[:, 2])
+    np.maximum.at(zmax, inv, pts[:, 2])
+    return (zmax - zmin)[inv] >= min_extent
+
 
 def ransac_facade_line(xy, tol, iters=1000, seed=0):
     """Возвращает (origin, direction, inlier_mask) доминирующей прямой в плане."""
@@ -86,18 +105,27 @@ def ransac_facade_line(xy, tol, iters=1000, seed=0):
     return c, direction, inl
 
 
-# ----------------------------------------------------------------------------
-# 3-4. Проекция на фасад и растеризация
-# ----------------------------------------------------------------------------
+def split_by_gaps(u_values, gap, min_len, min_points):
+    """Разбивает точки прямой на отдельные фасады по разрывам вдоль стены.
 
-def project_to_facade(pts, origin_xy, direction, slice_tol):
-    normal = np.array([-direction[1], direction[0]])
-    d = (pts[:, :2] - origin_xy) @ normal
-    keep = np.abs(d) < slice_tol
-    u = (pts[keep, :2] - origin_xy) @ direction
-    v = pts[keep, 2]
-    return u, v, keep
+    Возвращает список (u_min, u_max, n_points) непрерывных участков.
+    """
+    u_sorted = np.sort(u_values)
+    breaks = np.where(np.diff(u_sorted) > gap)[0]
+    starts = np.concatenate([[0], breaks + 1])
+    ends = np.concatenate([breaks, [len(u_sorted) - 1]])
+    segments = []
+    for s, e in zip(starts, ends):
+        lo, hi, n = u_sorted[s], u_sorted[e], e - s + 1
+        if hi - lo >= min_len and n >= min_points:
+            segments.append((float(lo), float(hi), int(n)))
+    segments.sort(key=lambda t: -t[2])
+    return segments
 
+
+# ----------------------------------------------------------------------------
+# 3-4. Растеризация
+# ----------------------------------------------------------------------------
 
 def rasterize(u, v, res):
     u0, v0 = u.min(), v.min()
@@ -122,8 +150,8 @@ def detect(density, res, min_opening_m2, min_rectangularity):
     ncomp, labels, stats, _ = cv2.connectedComponentsWithStats(occ)
     if ncomp < 2:
         raise RuntimeError("Пустая карта плотности — проверьте параметры среза")
-    main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    occ = (labels == main).astype(np.uint8)
+    main_c = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    occ = (labels == main_c).astype(np.uint8)
 
     # дыры = не-точки, не достижимые от границы кадра
     inv = (occ == 0).astype(np.uint8)
@@ -141,7 +169,7 @@ def detect(density, res, min_opening_m2, min_rectangularity):
         filled[hlabels == k] = 1
         if area < min_area_px:
             continue
-        rect_m = (x * res, y * res, w * res, h * res)  # в координатах фасада (u,v) от (0,0) растра
+        rect_m = (x * res, y * res, w * res, h * res)
         # шум точек делает края дыры рваными — замыкаем маску, чтобы
         # честный прямоугольник не терял прямоугольность из-за зазубрин
         hole = (hlabels[y:y + h, x:x + w] == k).astype(np.uint8)
@@ -149,7 +177,6 @@ def detect(density, res, min_opening_m2, min_rectangularity):
         rectangularity = float(hole.sum()) / float(w * h)
         (openings if rectangularity >= min_rectangularity else gaps).append(rect_m)
 
-    # внешний контур фасада
     contours, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     outline_px = max(contours, key=cv2.contourArea)
     eps = max(2.0, 0.03 / res * 0.5)
@@ -162,22 +189,19 @@ def detect(density, res, min_opening_m2, min_rectangularity):
 # 6. Вывод DXF, ортофото, превью
 # ----------------------------------------------------------------------------
 
-def write_dxf(path, outline, openings, gaps, offset_uv):
+def write_dxf(path, outline, openings, gaps):
     doc = ezdxf.new("R2018", setup=True)
     doc.header["$INSUNITS"] = 6  # метры
     msp = doc.modelspace()
     for name, color in [("FACADE_OUTLINE", 7), ("OPENINGS", 5), ("GAPS_REVIEW", 1)]:
         doc.layers.add(name, color=color)
 
-    u0, v0 = offset_uv
-    msp.add_lwpolyline(
-        [(u0 + p[0], v0 + p[1]) for p in outline],
-        close=True, dxfattribs={"layer": "FACADE_OUTLINE"})
+    msp.add_lwpolyline([(p[0], p[1]) for p in outline],
+                       close=True, dxfattribs={"layer": "FACADE_OUTLINE"})
     for layer, rects in [("OPENINGS", openings), ("GAPS_REVIEW", gaps)]:
         for (x, y, w, h) in rects:
             msp.add_lwpolyline(
-                [(u0 + x, v0 + y), (u0 + x + w, v0 + y),
-                 (u0 + x + w, v0 + y + h), (u0 + x, v0 + y + h)],
+                [(x, y), (x + w, y), (x + w, y + h), (x, y + h)],
                 close=True, dxfattribs={"layer": layer})
     doc.saveas(path)
 
@@ -203,6 +227,32 @@ def save_images(density, outline, openings, gaps, res, ortho_path, preview_path)
     cv2.imwrite(preview_path, prev)
 
 
+def save_scene_plan(pts_xy, facades, path, res=0.25):
+    """План сцены сверху с осями найденных фасадов и их номерами."""
+    x0, y0 = pts_xy.min(axis=0)
+    w = int((pts_xy[:, 0].max() - x0) / res) + 2
+    h = int((pts_xy[:, 1].max() - y0) / res) + 2
+    img = np.zeros((h, w), np.float32)
+    ix = ((pts_xy[:, 0] - x0) / res).astype(np.int32)
+    iy = ((pts_xy[:, 1] - y0) / res).astype(np.int32)
+    np.add.at(img, (iy, ix), 1.0)
+    img = np.clip(img / max(np.percentile(img[img > 0], 95), 1) * 255,
+                  0, 255).astype(np.uint8)
+    plan = cv2.cvtColor(cv2.flip(img, 0), cv2.COLOR_GRAY2BGR)
+
+    def to_px(p):
+        return (int((p[0] - x0) / res), h - 1 - int((p[1] - y0) / res))
+
+    for f in facades:
+        a = f["origin"] + f["u_range"][0] * f["direction"]
+        b = f["origin"] + f["u_range"][1] * f["direction"]
+        cv2.line(plan, to_px(a), to_px(b), (0, 255, 255), 2)
+        mid = to_px((a + b) / 2)
+        cv2.putText(plan, f"f{f['index']:02d}", (mid[0] + 4, mid[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 128, 255), 2)
+    cv2.imwrite(path, plan)
+
+
 def ensure_writable(out_path, las_path):
     """Проверяет, что выходной файл можно создать.
 
@@ -210,7 +260,6 @@ def ensure_writable(out_path, las_path):
     запись в Documents с невнятной ошибкой FileNotFoundError. В этом случае
     переносим вывод в папку исходного LAS.
     """
-    import os
     try:
         with open(out_path, "w"):
             pass
@@ -224,10 +273,47 @@ def ensure_writable(out_path, las_path):
         return fallback
 
 
+# ----------------------------------------------------------------------------
+# Обработка одного фасада
+# ----------------------------------------------------------------------------
+
+def process_facade(u, v, args, out_dxf, world):
+    area = (u.max() - u.min()) * (v.max() - v.min())
+    res = args.res
+    auto_res = float(np.sqrt(3.0 * area / max(len(u), 1)))
+    coarse = auto_res > res * 1.3
+    if coarse:
+        res = round(auto_res, 3)
+
+    density, (u0, v0) = rasterize(u, v, res)
+    outline, openings, gaps, _ = detect(density, res, args.min_opening, args.rect)
+
+    stem = out_dxf.rsplit(".", 1)[0]
+    write_dxf(out_dxf, outline, openings, gaps)
+    save_images(density, outline, openings, gaps, res,
+                stem + "_ortho.png", stem + "_preview.png")
+    origin, direction = world
+    with open(stem + "_meta.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "world_origin_xy": [float(origin[0]) + float(u0) * float(direction[0]),
+                                float(origin[1]) + float(u0) * float(direction[1])],
+            "facade_direction_xy": [float(direction[0]), float(direction[1])],
+            "v_zero_world_z": float(v0),
+            "raster_res_m": res,
+            "note": "точка DXF (u,v) -> мир: origin + u*direction, Z = v_zero + v",
+        }, f, ensure_ascii=False, indent=2)
+    return {"size": (u.max() - u.min(), v.max() - v.min()),
+            "openings": len(openings), "gaps": len(gaps),
+            "res": res, "coarse": coarse}
+
+
 def main():
-    ap = argparse.ArgumentParser(description="LAS -> DXF-подоснова фасада")
+    ap = argparse.ArgumentParser(description="LAS -> DXF-подоснова фасадов")
     ap.add_argument("las", help="входной файл LAS/LAZ")
-    ap.add_argument("-o", "--out", default="facade.dxf", help="выходной DXF")
+    ap.add_argument("-o", "--out", default="facade.dxf",
+                    help="базовое имя выходных DXF (фасады получат суффикс _fNN)")
+    ap.add_argument("--facades", type=int, default=8,
+                    help="максимум фасадов за запуск (по умолчанию 8)")
     ap.add_argument("--res", type=float, default=0.02,
                     help="разрешение растра, м/пиксель (по умолчанию 0.02)")
     ap.add_argument("--plane-tol", type=float, default=0.08,
@@ -240,55 +326,73 @@ def main():
                     help="порог прямоугольности: выше — проём, ниже — пропуск данных")
     ap.add_argument("--max-points", type=int, default=15_000_000,
                     help="прореживание облака до N точек (по умолчанию 15 млн)")
+    ap.add_argument("--gap", type=float, default=3.0,
+                    help="разрыв в плане, разделяющий здания на одной линии, м")
+    ap.add_argument("--min-facade-len", type=float, default=4.0,
+                    help="минимальная длина фасада, м")
     args = ap.parse_args()
 
     print(f"Читаю {args.las} ...")
     pts, _ = read_las(args.las, args.max_points)
     print(f"  точек: {len(pts):,}")
 
-    print("Ищу плоскость фасада (RANSAC)...")
-    origin_xy, direction, inl = ransac_facade_line(pts[:, :2], args.plane_tol)
-    print(f"  инлайеров: {int(inl.sum()):,} ({inl.mean() * 100:.0f}% облака), "
-          f"направление в плане: ({direction[0]:+.3f}, {direction[1]:+.3f})")
+    out_base = ensure_writable(args.out, args.las)
+    stem_base = out_base.rsplit(".", 1)[0]
 
-    u, v, _ = project_to_facade(pts, origin_xy, direction, args.slice)
+    vert = filter_vertical(pts)
+    print(f"  вертикальных структур: {int(vert.sum()):,} точек "
+          f"({vert.mean() * 100:.0f}%), земля и низкий мусор отброшены")
+    work = pts[vert]
+    min_wall_points = max(15_000, int(0.003 * len(pts)))
+    facades, fidx = [], 0
+    while fidx < args.facades and len(work) > 2 * min_wall_points:
+        try:
+            origin, direction, inl = ransac_facade_line(
+                work[:, :2], args.plane_tol, seed=fidx)
+        except RuntimeError:
+            break
+        if int(inl.sum()) < min_wall_points:
+            break
 
-    # при редком облаке мелкий растр разваливается на несвязные точки —
-    # подбираем шаг так, чтобы на ячейку приходилось ~3 точки стены
-    area = (u.max() - u.min()) * (v.max() - v.min())
-    res = args.res
-    auto_res = float(np.sqrt(3.0 * area / max(len(u), 1)))
-    if auto_res > res * 1.3:
-        res = round(auto_res, 3)
-        print(f"  ВНИМАНИЕ: точек в срезе мало ({len(u):,} на {area:.0f} м²) — "
-              f"растр укрупнён до {res} м/px.\n"
-              f"  Для детализации дайте больше точек: --max-points 30000000, "
-              f"либо вырежьте один фасад из облака (ReCap/CloudCompare).")
+        normal = np.array([-direction[1], direction[0]])
+        dist = (work[:, :2] - origin) @ normal
+        u_all = (work[:, :2] - origin) @ direction
+        segments = split_by_gaps(u_all[inl], args.gap,
+                                 args.min_facade_len, min_wall_points)
 
-    density, (u0, v0) = rasterize(u, v, res)
-    print(f"Растр {density.shape[1]}x{density.shape[0]} px @ {res} м/px; "
-          f"фасад ~{(u.max() - u.min()):.1f} x {(v.max() - v.min()):.1f} м")
+        for (lo, hi, n) in segments:
+            if fidx >= args.facades:
+                break
+            sel = (np.abs(dist) < args.slice) & (u_all > lo - 0.5) & (u_all < hi + 0.5)
+            u, v = u_all[sel], work[sel, 2]
+            fidx += 1
+            out_dxf = f"{stem_base}_f{fidx:02d}.dxf"
+            try:
+                info = process_facade(u, v, args, out_dxf, (origin, direction))
+            except (RuntimeError, ValueError) as e:
+                print(f"  f{fidx:02d}: пропущен ({e})")
+                fidx -= 1
+                continue
+            note = f" [растр укрупнён до {info['res']} м/px]" if info["coarse"] else ""
+            print(f"  f{fidx:02d}: {info['size'][0]:.1f} x {info['size'][1]:.1f} м, "
+                  f"проёмов {info['openings']}, на проверку {info['gaps']}"
+                  f" -> {out_dxf}{note}")
+            facades.append({"index": fidx, "origin": origin,
+                            "direction": direction, "u_range": (lo, hi)})
 
-    outline, openings, gaps, _ = detect(density, res,
-                                        args.min_opening, args.rect)
-    print(f"Найдено проёмов: {len(openings)}, зон на проверку (пропуски): {len(gaps)}")
+        # убираем обработанную плоскость из рабочего облака
+        work = work[np.abs(dist) > 1.5 * args.slice]
 
-    out = ensure_writable(args.out, args.las)
-    stem = out.rsplit(".", 1)[0]
-    write_dxf(out, outline, openings, gaps, (0.0, 0.0))
-    save_images(density, outline, openings, gaps, res,
-                stem + "_ortho.png", stem + "_preview.png")
-    with open(stem + "_meta.json", "w", encoding="utf-8") as f:
-        json.dump({
-            "las": args.las,
-            "world_origin_xy": [float(origin_xy[0]) + float(u0) * float(direction[0]),
-                                float(origin_xy[1]) + float(u0) * float(direction[1])],
-            "facade_direction_xy": [float(direction[0]), float(direction[1])],
-            "v_zero_world_z": float(v0),
-            "note": "точка DXF (u,v) -> мир: origin + u*direction, Z = v_zero + v",
-        }, f, ensure_ascii=False, indent=2)
+    if not facades:
+        print("Фасады не найдены — попробуйте увеличить --plane-tol или --slice")
+        return 1
 
-    print(f"Готово: {out}, {stem}_ortho.png, {stem}_preview.png, {stem}_meta.json")
+    plan_path = stem_base + "_scene_plan.png"
+    sample = pts if len(pts) <= 3_000_000 else \
+        pts[np.random.default_rng(1).choice(len(pts), 3_000_000, replace=False)]
+    save_scene_plan(sample[:, :2], facades, plan_path)
+    print(f"Готово: фасадов {len(facades)}; план сцены с номерами: {plan_path}")
+    return 0
 
 
 if __name__ == "__main__":
